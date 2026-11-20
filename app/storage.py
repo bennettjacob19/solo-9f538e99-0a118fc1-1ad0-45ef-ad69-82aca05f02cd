@@ -51,6 +51,7 @@ from typing import Iterator
 
 from .config import Settings
 from .deb import DebError, DebInfo, inspect_deb
+from .drill import InstalledPackage, SelectedPackage, read_selected_packages
 from .indexer import (
     PackageEntry,
     gzip_bytes,
@@ -65,6 +66,23 @@ _CHUNK = 1024 * 1024
 
 class PublicationError(Exception):
     """A publication could not be completed; repository state is unchanged."""
+
+
+class ReleaseLookupError(Exception):
+    """A rehearsal cannot use the requested release or package.
+
+    ``code`` distinguishes the three separate failure categories the API
+    reports: a release that is no longer downloadable, a package digest that
+    is not part of the selected release, and a package file that cannot be
+    read.  The rehearsal itself never writes anything, so this does not alter
+    the repository state either.
+    """
+
+    def __init__(self, code: str, message: str, details: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
 
 
 @dataclass(frozen=True)
@@ -131,6 +149,34 @@ class FileLease:
     def close(self) -> None:
         with contextlib.suppress(Exception):
             self.fh.close()  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
+class OpenedPackage:
+    """One ``.deb`` of a release, opened for reading without copying."""
+
+    sha256: str
+    filename: str
+    fh: object
+
+
+@dataclass(frozen=True)
+class ReleaseSnapshot:
+    """A point-in-time view of one committed publication.
+
+    The descriptors are opened while the publication lock is held, so the
+    rehearsal can keep reading the original packages even if a later
+    publication's garbage collection unlinks them from the export tree.
+    """
+
+    release: int
+    created_at: str
+    opened: tuple[OpenedPackage, ...]
+
+    def close(self) -> None:
+        for package in self.opened:
+            with contextlib.suppress(Exception):
+                package.fh.close()  # type: ignore[attr-defined]
 
 
 def sha256_file(path: Path) -> str:
@@ -279,6 +325,143 @@ class Repository:
                 "ORDER BY id DESC LIMIT 1"
             ).fetchone()
         return self._row_to_publication(row) if row else None
+
+    # -------------------------------------------------------------- rehearsals
+    def _retained_release_ids(self, db: sqlite3.Connection) -> list[int]:
+        rows = db.execute(
+            "SELECT id FROM publications WHERE state='committed' "
+            "ORDER BY id DESC LIMIT ?",
+            (self.settings.retention,),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def open_release_snapshot(
+        self, release: int, digests: tuple[str, ...]
+    ) -> ReleaseSnapshot:
+        """Open the requested packages of a still-downloadable release.
+
+        Everything is validated and every descriptor is opened while the
+        publication lock is held.  Once this method returns, the caller owns
+        live descriptors: later publications may evict the release from the
+        public tree, but the rehearsal still reads the original bytes because
+        POSIX keeps an unlinked inode alive while it is open.  No file is
+        copied and no repository state is modified.
+        """
+
+        with self._exclusive():
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT * FROM publications WHERE id=? AND state='committed'",
+                    (release,),
+                ).fetchone()
+                retained = self._retained_release_ids(db)
+            if row is None:
+                raise ReleaseLookupError(
+                    "release_not_available",
+                    f"release {release} is not a successful publication",
+                )
+            if release not in retained:
+                raise ReleaseLookupError(
+                    "release_not_available",
+                    f"release {release} is no longer downloadable; only the "
+                    f"newest {self.settings.retention} successful releases are kept",
+                )
+            release_file = (
+                self.export
+                / f"{self.settings.release_by_hash_prefix}/{row['release_sha256']}"
+            )
+            if not release_file.is_file():
+                raise ReleaseLookupError(
+                    "release_not_available",
+                    f"release {release} is no longer downloadable: its Release "
+                    "file has been removed",
+                )
+
+            try:
+                entries = json.loads(row["packages_json"])
+            except (TypeError, ValueError) as exc:  # pragma: no cover - corruption
+                raise ReleaseLookupError(
+                    "release_not_available",
+                    f"release {release} has an unreadable package list",
+                ) from exc
+            by_digest: dict[str, dict[str, object]] = {}
+            for entry in entries:
+                try:
+                    by_digest[str(entry["sha256"]).lower()] = entry
+                except (KeyError, TypeError):  # pragma: no cover - corruption
+                    continue
+
+            missing = [digest for digest in digests if digest not in by_digest]
+            if missing:
+                raise ReleaseLookupError(
+                    "package_not_in_release",
+                    "the selected release does not contain: " + ", ".join(missing),
+                    tuple(missing),
+                )
+
+            opened: list[OpenedPackage] = []
+            try:
+                for digest in digests:
+                    entry = by_digest[digest]
+                    filename = str(entry["filename"])
+                    path = self._safe_export_path(filename)
+                    if path is None:
+                        raise ReleaseLookupError(
+                            "package_not_in_release",
+                            f"release {release} lists an unsafe package path: {filename}",
+                            (digest,),
+                        )
+                    try:
+                        fh = path.open("rb")
+                    except OSError as exc:
+                        raise ReleaseLookupError(
+                            "package_unreadable",
+                            f"{filename}: cannot open package: {exc}",
+                            (digest,),
+                        ) from exc
+                    opened.append(OpenedPackage(sha256=digest, filename=filename, fh=fh))
+            except BaseException:
+                for package in opened:
+                    with contextlib.suppress(Exception):
+                        package.fh.close()  # type: ignore[attr-defined]
+                raise
+            return ReleaseSnapshot(
+                release=release,
+                created_at=str(row["created_at"]),
+                opened=tuple(opened),
+            )
+
+    def _safe_export_path(self, relpath: str) -> Path | None:
+        if not relpath or relpath.startswith("/") or "\x00" in relpath:
+            return None
+        parts = relpath.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            return None
+        candidate = self.export.joinpath(*parts)
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(self.export)
+        except (OSError, ValueError):
+            return None
+        return resolved
+
+    def rehearse(
+        self,
+        release: int,
+        digests: tuple[str, ...],
+        installed: tuple[InstalledPackage, ...],
+    ) -> tuple[ReleaseSnapshot, tuple[SelectedPackage, ...]]:
+        """Open the release snapshot and read every selected package."""
+
+        snapshot = self.open_release_snapshot(release, digests)
+        try:
+            selected = read_selected_packages(
+                snapshot.opened, self.settings.architecture, release
+            )
+        except BaseException:
+            snapshot.close()
+            raise
+        return snapshot, selected
 
     # ------------------------------------------------------------- publishing
     def publish(self, uploads: list[StagedUpload]) -> Publication:

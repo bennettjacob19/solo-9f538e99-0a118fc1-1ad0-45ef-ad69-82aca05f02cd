@@ -21,7 +21,8 @@ curl -fsS -X POST http://127.0.0.1:8080/api/publish \
 ```
 
 也可以直接用浏览器打开 <http://127.0.0.1:8080/docs> 的上传表单
-（OpenAPI 文档在 `/swagger-ui`）。
+（OpenAPI 文档在 `/swagger-ui`）。解包顺序演练的请求体同样可以在
+`/swagger-ui` 的 `POST /api/rehearse` 表单里填写，见下文。
 
 ## 客户端配置与实测
 
@@ -91,14 +92,91 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/publish` | multipart 字段 `files`，一次一批，返回 201 与发布记录 |
+| POST | `/api/rehearse` | 解包顺序演练（只读，见下节） |
 | GET | `/api/status` | 当前配置、最新发布、发布历史 |
 | GET | `/api/publications` | 发布历史（含 `aborted`） |
 | GET | `/docs` | 上传表单 |
-| GET | `/swagger-ui` | OpenAPI 文档 |
+| GET | `/swagger-ui` | OpenAPI 文档（含 `/api/rehearse` 的请求表单） |
 | GET/HEAD | `/dists/...`、`/pool/...` | 仓库文件（只读） |
 
 错误语义：包非法 / 重复的同名同版本 / 批次超限返回 `400`/`413`，且
 仓库状态完全不变。
+
+## 解包顺序演练（`POST /api/rehearse`）
+
+判断「按给定顺序解包这一批 `.deb`，哪一步会覆盖别的包的文件」。演练只读
+发布中的包，**不复制 `.deb`、不改发布状态**，可随时重复执行。
+
+请求体（在 `/swagger-ui` 里可直接填表）：
+
+```json
+{
+  "release": 3,
+  "packages": ["<sha256-of-first-unpacked.deb>", "<sha256-of-second.deb>"],
+  "installed": [
+    {"name": "alpha", "version": "1.0", "files": ["/usr/share/x/shared"]}
+  ]
+}
+```
+
+- `release`：发布号（`/api/publish` 返回的 `id`，即 `/api/status` 中的发布记录号）。
+  必须是仍可下载的已提交发布；被淘汰或不存在时单独报错。
+- `packages`：**2～8 个** `.deb` 的 SHA-256，数组顺序即解包顺序；同名包只能选一个。
+  SHA-256 必须属于所选发布。
+- `installed`：目标机已安装的包，含名称、Debian 版本，以及各自拥有的
+  **普通文件绝对路径**。目录、符号链接不算文件归属。
+
+规则：
+
+- 包覆盖自己拥有的文件总是允许，与版本无关。
+- 覆盖别的包的文件，必须由本包的 `Replaces` 命中**当时的属主包名**，且
+  `Replaces` 的版本约束要匹配**当时的属主版本**（Debian 版本序，含 epoch/~）。
+- 每一步通过后，模拟状态更新：该包版本变为新版本，文件归属改到该包名下；
+  旧版本拥有、新版本不再提供的路径被释放（无属主），后续包可直接安装。
+- 首个受阻步骤即结束，返回该步骤的包名/版本、冲突路径、当时的属主包名/版本。
+  全部通过则报告 `result: "ok"`（无冲突）。
+
+成功响应（HTTP 200）示例：
+
+```json
+{
+  "release": 3,
+  "result": "conflict",
+  "conflict": {
+    "step": 2, "package": "gamma", "version": "2.0",
+    "path": "/usr/share/x/shared",
+    "owner_package": "delta", "owner_version": "2.0"
+  },
+  "steps": [{"step": 1, "package": "delta", "overwritten": 1, "released": []}],
+  "first_blocked_step": 2,
+  "conflict_path": "/usr/share/x/shared",
+  "owner_package": "delta",
+  "owner_version": "2.0"
+}
+```
+
+错误是分开的，统一为 `{"error": "rehearsal_rejected", "release": N, "reason": {...}}`：
+
+| 状态码 | `reason.code` | 含义 |
+| --- | --- | --- |
+| 400 | `invalid_manifest` | 清单有误：包数不在 2～8、重复 SHA-256、同名包重复、版本或路径非法等 |
+| 404 | `release_not_available` | 发布号不存在、未成功提交，或已被保留策略淘汰 |
+| 409 | `package_not_in_release` | 所选 SHA-256 不属于该发布（`details` 列出缺失项） |
+| 422 | `package_unreadable` | 发布索引里列有该包，但 `.deb` 读不出或内容与索引不符 |
+
+接收演练时会在持有发布锁的情况下打开所有所选包的描述符，之后才开始模拟；
+因此**即使演练期间有新发布淘汰了所选发布，本次演练仍用原包完成**。新版照常
+发布，过期包照常从公共下载地址移除，两者互不影响。
+
+命令行示例：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/rehearse \
+  -H 'content-type: application/json' \
+  -d @drill.json | python3 -m json.tool
+# 或直接从仓库里的 .deb 生成 SHA-256：
+sha256sum *.deb
+```
 
 ## 配置
 
@@ -128,9 +206,13 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest httpx
 uvicorn app.main:app --reload          # 数据写入 ./data
-pytest -q                              # 22 项测试
+pytest -q                              # 55 项测试
 ```
 
 测试覆盖：发布/回读、旧 Release 按哈希取旧索引与旧包、同名同版本重发、
 两版保留与第三版淘汰、坏包整批拒绝、错误架构拒绝、提交前中断回滚、
-提交后崩溃恢复、下载中被 GC、Release 格式与 by-hash 服务、路径穿越。
+提交后崩溃恢复、下载中被 GC、Release 格式与 by-hash 服务、路径穿越；
+以及解包演练：无冲突、首个受阻步骤、`Replaces` 命中/版本不匹配、
+同包自覆盖、版本随步骤推进、旧文件释放、符号链接不属文件、包数/重复
+SHA-256/同名包/路径校验、失效发布与包不在发布中、包不可读、演练不改
+仓库、演练期间发布被淘汰仍用原包完成、Debian 版本序与 `Replaces` 解析。

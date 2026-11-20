@@ -4,6 +4,7 @@ Routes
 ------
 ``GET  /docs``                      interactive upload form
 ``POST /api/publish``               upload a batch of ``.deb`` files and publish
+``POST /api/rehearse``              dry-run an unpack order of release packages
 ``GET  /api/status``                repository state and publication history
 ``GET  /dists/...``, ``GET /pool/...``  the APT document tree (read-only)
 ``GET  /``                          plain-text instructions / sources.list
@@ -11,7 +12,8 @@ Routes
 
 Every upload is written to a private intake directory, validated and hashed,
 and only then committed under a lock.  See :mod:`app.storage` for the
-transaction and recovery protocol.
+transaction and recovery protocol.  Rehearsals are read-only: they open the
+selected release's packages and never copy a file or change a publication.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ from pathlib import Path
 import anyio
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import (
     HTMLResponse,
@@ -35,10 +39,24 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .config import Settings
-from .storage import PublicationError, Repository, StagedUpload
+from .drill import (
+    DrillError,
+    SCHEMA_NOTES,
+    InstalledPackage,
+    normalize_sha256_values,
+    simulate,
+    validate_installed,
+)
+from .storage import (
+    PublicationError,
+    ReleaseLookupError,
+    Repository,
+    StagedUpload,
+)
 
 #: Content types Debian clients expect for the repository documents.
 _MEDIA_TYPES = {
@@ -85,6 +103,64 @@ def _media_type(relpath: str) -> str:
     return _MEDIA_TYPES.get(name, "application/octet-stream")
 
 
+# --------------------------------------------------------------- drill models
+class InstalledPackageModel(BaseModel):
+    """A package already installed on the simulated target machine."""
+
+    name: str = Field(
+        ..., description="Debian package name", examples=["libfoo"], min_length=2
+    )
+    version: str = Field(
+        ..., description="Installed Debian version", examples=["1.2.3-1"]
+    )
+    files: list[str] = Field(
+        ...,
+        description=(
+            "Absolute paths of the regular files this package owns on the "
+            "target machine (not directories)"
+        ),
+        examples=[["/usr/lib/libfoo.so.1", "/usr/share/doc/libfoo/copyright"]],
+    )
+
+
+class RehearsalRequest(BaseModel):
+    """Request body of ``POST /api/rehearse``.
+
+    The package list is ordered: it is the order in which the packages would
+    be unpacked.  Each entry is the SHA-256 of a ``.deb`` in the selected
+    release, and a package name may appear only once.
+    """
+
+    release: int = Field(
+        ...,
+        ge=1,
+        description="Publication number of a release that is still downloadable",
+        examples=[3],
+    )
+    packages: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description=(
+            "SHA-256 of each .deb in unpack order; 2 to 8 entries, "
+            "at most one package per package name"
+        ),
+        examples=[
+            [
+                "01754aaca31f14ded926669676cdd65b8c8e40412e5e66fd827f91740d86f11f",
+                "58b114f5afdacc20c47fad080564cf8da17fef9ad7a395c78dce9d259ac44cb4",
+            ]
+        ],
+    )
+    installed: list[InstalledPackageModel] = Field(
+        default_factory=list,
+        description=(
+            "Packages currently installed on the target machine, with the "
+            "absolute paths of the regular files each of them owns"
+        ),
+    )
+
+
 _STREAM_CHUNK = 256 * 1024
 
 
@@ -114,7 +190,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description=(
             "Single-suite, single-component APT repository with atomic "
             "publications and Acquire-By-Hash retention of the last two "
-            "successful releases."
+            "successful releases. ``POST /api/rehearse`` dry-runs the unpack "
+            "order of a release against a simulated target machine.\n\n"
+            + SCHEMA_NOTES
         ),
         lifespan=lifespan,
         # /docs is the upload form; the generated OpenAPI UI lives at /swagger.
@@ -124,6 +202,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.repository = repository
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """Report a malformed rehearsal manifest in the rehearsal's own shape.
+
+        A schema violation (for example fewer than two packages, or a missing
+        ``installed[].files``) is a malformed manifest, not a generic HTTP
+        error; mapping it here keeps the three separate error categories
+        distinguishable by ``reason.code``.
+        """
+
+        if request.url.path != "/api/rehearse":
+            return JSONResponse(
+                status_code=422, content={"detail": jsonable_encoder(exc.errors())}
+            )
+        details: list[str] = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc", ()))
+            details.append(f"{location}: {error.get('msg', 'invalid value')}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "rehearsal_rejected",
+                "reason": {
+                    "code": "invalid_manifest",
+                    "message": "the rehearsal manifest is malformed",
+                    "details": details,
+                },
+            },
+        )
 
     @app.get("/", response_class=PlainTextResponse)
     def root() -> str:
@@ -224,6 +334,95 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "release_url": f"/{settings.release_path}",
             },
         )
+
+    @app.post(
+        "/api/rehearse",
+        response_model=None,
+        summary="Dry-run an unpack order against the target machine",
+        responses={
+            200: {"description": "Every step passed, or the first conflict"},
+            400: {"description": "Malformed manifest"},
+            404: {"description": "Release is not downloadable"},
+            409: {"description": "Package SHA-256 not in the selected release"},
+            422: {"description": "A selected package could not be read"},
+        },
+    )
+    def rehearse(request: RehearsalRequest) -> Response:
+        try:
+            digests = normalize_sha256_values(request.packages)
+            installed = validate_installed(
+                InstalledPackage(name=item.name, version=item.version, files=tuple(item.files))
+                for item in request.installed
+            )
+        except DrillError as exc:
+            return JSONResponse(
+                status_code=exc.status,
+                content={
+                    "error": "rehearsal_rejected",
+                    "release": request.release,
+                    "reason": exc.to_dict(),
+                },
+            )
+
+        snapshot = None
+        created_at: str | None = None
+        try:
+            snapshot, selected = repository.rehearse(
+                request.release, digests, installed
+            )
+            created_at = snapshot.created_at
+            outcome = simulate(selected, installed)
+        except ReleaseLookupError as exc:
+            status = {
+                "release_not_available": 404,
+                "package_not_in_release": 409,
+                "package_unreadable": 422,
+            }.get(exc.code, 400)
+            return JSONResponse(
+                status_code=status,
+                content={
+                    "error": "rehearsal_rejected",
+                    "release": request.release,
+                    "reason": {
+                        "code": exc.code,
+                        "message": exc.message,
+                        **({"details": list(exc.details)} if exc.details else {}),
+                    },
+                },
+            )
+        except DrillError as exc:
+            status = exc.status or 400
+            return JSONResponse(
+                status_code=status,
+                content={
+                    "error": "rehearsal_rejected",
+                    "release": request.release,
+                    "reason": exc.to_dict(),
+                },
+            )
+        finally:
+            if snapshot is not None:
+                snapshot.close()
+
+        payload: dict[str, object] = {
+            "release": request.release,
+            "release_created_at": created_at,
+            "packages": [
+                {
+                    "sha256": package.sha256,
+                    "package": package.name,
+                    "version": package.version,
+                    "files": len(package.files),
+                }
+                for package in selected
+            ],
+            "installed": [
+                {"package": pkg.name, "version": pkg.version, "files": len(pkg.files)}
+                for pkg in installed
+            ],
+            **outcome.to_dict(),
+        }
+        return JSONResponse(status_code=200, content=payload)
 
     @app.get("/api/status")
     def status() -> JSONResponse:
