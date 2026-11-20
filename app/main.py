@@ -26,6 +26,7 @@ from pathlib import Path
 import anyio
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import (
     HTMLResponse,
@@ -35,9 +36,16 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
+from pydantic import BaseModel, Field, field_validator
 from starlette.background import BackgroundTask
 
 from .config import Settings
+from .rehearsal import (
+    InstalledPackage,
+    RehearsalError,
+    RehearsalEngine,
+    validate_manifest,
+)
 from .storage import PublicationError, Repository, StagedUpload
 
 #: Content types Debian clients expect for the repository documents.
@@ -88,6 +96,67 @@ def _media_type(relpath: str) -> str:
 _STREAM_CHUNK = 256 * 1024
 
 
+class InstalledPackageModel(BaseModel):
+    """One package already installed on the target machine."""
+
+    name: str = Field(..., description="installed package name")
+    version: str = Field(..., description="installed Debian version")
+    files: list[str] = Field(
+        default_factory=list,
+        description="absolute paths of the regular files owned by the package",
+    )
+
+    @field_validator("name", "version")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("files")
+    @classmethod
+    def _absolute_paths(cls, value: list[str]) -> list[str]:
+        for path in value:
+            if not path.startswith("/"):
+                raise ValueError(f"not an absolute path: {path!r}")
+        return value
+
+
+class RehearsalRequest(BaseModel):
+    """A conflict-check rehearsal over one retained publication."""
+
+    publication_id: int = Field(
+        ..., gt=0, description="id of a still-downloadable publication"
+    )
+    package_sha256: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=8,
+        description="package SHA-256 digests in the planned unpack order; "
+        "same-named packages may appear only once",
+    )
+    installed: list[InstalledPackageModel] = Field(
+        default_factory=list,
+        description="packages already installed on the target machine, with "
+        "the absolute regular-file paths each one owns",
+    )
+
+    @field_validator("package_sha256")
+    @classmethod
+    def _sha256_shape(cls, value: list[str]) -> list[str]:
+        import re
+
+        pattern = re.compile(r"^[0-9a-f]{64}$")
+        seen: set[str] = set()
+        for digest in value:
+            if not pattern.match(digest):
+                raise ValueError(f"not a lowercase SHA-256 digest: {digest!r}")
+            if digest in seen:
+                raise ValueError(f"duplicate package digest: {digest}")
+            seen.add(digest)
+        return value
+
+
 async def _stream(lease) -> AsyncIterator[bytes]:  # type: ignore[no-untyped-def]
     """Yield the leased file in chunks without blocking the event loop."""
 
@@ -124,6 +193,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.repository = repository
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        # A malformed rehearsal manifest is a client error, not a framework 422.
+        issues = [
+            {
+                "location": list(error.get("loc", ())),
+                "message": error.get("msg", ""),
+                "type": error.get("type", ""),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "error": "invalid_manifest",
+                    "detail": "request body does not match the rehearsal schema",
+                    "issues": issues,
+                }
+            },
+        )
 
     @app.get("/", response_class=PlainTextResponse)
     def root() -> str:
@@ -234,6 +327,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             {"publications": [p.to_dict() for p in repository.list_publications(50)]}
         )
+
+    @app.post("/api/rehearsals", response_model=None)
+    def rehearse(body: RehearsalRequest) -> JSONResponse:
+        """Simulate an unpack order without touching the repository.
+
+        The rehearsal reads the selected pool packages through open
+        descriptors, so an accepted run completes even if the selected
+        publication is evicted concurrently.  No ``.deb`` is copied and no
+        publication state changes.
+        """
+
+        installed = [
+            InstalledPackage(
+                name=item.name, version=item.version, files=tuple(item.files)
+            )
+            for item in body.installed
+        ]
+        # The engine re-validates the manifest (defence in depth) and then
+        # resolves the publication and parses every selected package.
+        try:
+            validate_manifest(
+                body.publication_id, body.package_sha256, installed
+            )
+            result = RehearsalEngine(repository).run(
+                body.publication_id, list(body.package_sha256), installed
+            )
+        except RehearsalError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error": exc.code, "detail": str(exc)},
+            ) from exc
+        return JSONResponse(result.to_dict())
 
     def _lease_headers(lease) -> dict[str, str]:  # type: ignore[no-untyped-def]
         return {

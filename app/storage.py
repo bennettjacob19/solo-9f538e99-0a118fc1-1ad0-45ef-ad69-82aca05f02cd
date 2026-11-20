@@ -280,6 +280,52 @@ class Repository:
             ).fetchone()
         return self._row_to_publication(row) if row else None
 
+    def retained_publication_ids(self) -> set[int]:
+        """IDs of the committed publications still kept on the public tree."""
+
+        s = self.settings
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id FROM publications WHERE state='committed' "
+                "ORDER BY id DESC LIMIT ?",
+                (s.retention,),
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
+
+    def publication_by_id(self, publication_id: int) -> Publication | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM publications WHERE id=?", (publication_id,)
+            ).fetchone()
+        return self._row_to_publication(row) if row else None
+
+    def publication_packages(self, publication_id: int) -> list[dict[str, object]]:
+        """The package entries recorded by a publication journal row."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT packages_json FROM publications WHERE id=?",
+                (publication_id,),
+            ).fetchone()
+        if row is None:
+            return []
+        return json.loads(row["packages_json"])
+
+    def find_pool_entry(
+        self, publication_id: int, digest: str
+    ) -> dict[str, object] | None:
+        """Find a package entry by SHA-256 inside one publication's journal."""
+
+        for entry in self.publication_packages(publication_id):
+            if entry.get("sha256") == digest:
+                return entry
+        return None
+
+    def open_pool_file(self, relpath: str) -> FileLease | None:
+        """Open a pool ``.deb`` read-only, keeping the descriptor across GC."""
+
+        return self.open_file(relpath)
+
     # ------------------------------------------------------------- publishing
     def publish(self, uploads: list[StagedUpload]) -> Publication:
         if not uploads:

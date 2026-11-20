@@ -91,4 +91,39 @@ curl -fsS -o /dev/null "$REPO_URL/dists/stable/main/binary-amd64/by-hash/SHA256/
 curl -fsS -o /dev/null "$REPO_URL/dists/stable/main/binary-amd64/by-hash/SHA256/$IDX3"
 echo "== retention keeps exactly the two most recent releases"
 
+# Rehearsal: the current (still downloadable) publication must accept an
+# unpack-order simulation, while the evicted release 1 must be rejected.
+CURRENT_ID=$(curl -fsS "$REPO_URL/api/status" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["current"]["id"])')
+CURRENT_SHA=$(sha256sum "$THREE_A" | cut -d' ' -f1)
+REHEARSAL=$(curl -fsS -X POST "$REPO_URL/api/rehearsals" \
+    -H 'Content-Type: application/json' \
+    -d "{\"publication_id\": $CURRENT_ID,
+         \"package_sha256\": [\"$CURRENT_SHA\", \"$CURRENT_SHA\"],
+         \"installed\": []}" || true)
+if [ -n "$REHEARSAL" ]; then
+    echo "FAIL: duplicate digest rehearsal should have been rejected" >&2
+    exit 1
+fi
+REHEARSAL=$(curl -fsS -X POST "$REPO_URL/api/rehearsals" \
+    -H 'Content-Type: application/json' \
+    -d "{\"publication_id\": $CURRENT_ID,
+         \"package_sha256\": [\"$CURRENT_SHA\"],
+         \"installed\": []}" || true)
+if [ -n "$REHEARSAL" ]; then
+    echo "FAIL: single-package rehearsal should have been rejected" >&2
+    exit 1
+fi
+# The evicted first publication (id 1 when the journal starts empty) must be
+# refused even though the request is otherwise well formed.
+if curl -fsS -X POST "$REPO_URL/api/rehearsals" \
+    -H 'Content-Type: application/json' \
+    -d "{\"publication_id\": 1,
+         \"package_sha256\": [\"$CURRENT_SHA\", \"$(sha256sum "$TWO_B" | cut -d' ' -f1)\"],
+         \"installed\": []}" >/dev/null; then
+    echo "FAIL: rehearsal accepted an evicted publication" >&2
+    exit 1
+fi
+echo "== rehearsal rejects bad manifests and evicted publications"
+
 echo "== OK"

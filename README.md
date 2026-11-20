@@ -91,14 +91,96 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/publish` | multipart 字段 `files`，一次一批，返回 201 与发布记录 |
+| POST | `/api/rehearsals` | 解包顺序演练：模拟文件归属与 `Replaces` 冲突，不改仓库状态 |
 | GET | `/api/status` | 当前配置、最新发布、发布历史 |
 | GET | `/api/publications` | 发布历史（含 `aborted`） |
 | GET | `/docs` | 上传表单 |
-| GET | `/swagger-ui` | OpenAPI 文档 |
+| GET | `/swagger-ui` | OpenAPI 文档（演练接口的请求结构亦在此填写） |
 | GET/HEAD | `/dists/...`、`/pool/...` | 仓库文件（只读） |
 
 错误语义：包非法 / 重复的同名同版本 / 批次超限返回 `400`/`413`，且
 仓库状态完全不变。
+
+## 解包顺序演练（rehearsal）
+
+排定一批 `.deb` 的解包顺序后，先在仓库上做一次纯模拟，确认哪一步会
+覆盖别的包的文件。演练**不复制 `.deb`、不改任何发布状态**；受理后即使
+所选发布被新发布淘汰，仍通过已打开的文件描述符用原包跑完整个流程
+（POSIX inode 语义，GC 只删目录项）。
+
+请求体（也可直接在 `/swagger-ui` 中填写）：
+
+```json
+{
+  "publication_id": 7,
+  "package_sha256": [
+    "9f2c…（2～8 个，按解包顺序，同名包只选一个）",
+    "1b8e…"
+  ],
+  "installed": [
+    {
+      "name": "libold",
+      "version": "1.5-2",
+      "files": ["/usr/lib/libold.so.1", "/usr/bin/oldtool"]
+    }
+  ]
+}
+```
+
+- `publication_id` 必须是**仍可下载**的发布（保留窗口内的 `committed`
+  记录）；未知或已淘汰发布返回 `404 publication_unavailable`。
+- `package_sha256` 为 2～8 个小写十六进制 SHA-256，按计划解包顺序排列；
+  同一摘要不得重复。包不在所选发布中返回
+  `404 package_not_in_publication`；池文件读取/解析失败返回
+  `422 package_read_failed`；清单结构非法返回 `400 invalid_manifest`。
+- `installed` 是目标机现状：每个已装包给出名称、Debian 版本及其拥有的
+  **普通文件绝对路径**；同一台机器上同一路径不能归两个包所有。
+
+模拟规则（每步通过后才推进状态，遇首个受阻步骤即停）：
+
+1. 从每个 `.deb` 的数据归档读取普通文件（目录、符号/硬链接、设备节点
+   均不算），把归档内相对路径（如 `./usr/bin/x`）换算成安装后的绝对
+   路径（`/usr/bin/x`），并读取控制字段 `Replaces`。
+2. 本包已拥有的路径可直接覆盖。
+3. 覆盖**别的包**的路径时，该包的 `Replaces` 必须匹配路径**当时**的属主
+   包名与属主版本（无版本子句匹配任意版本；带版本子句按 Debian Policy
+   5.6.3 的版本比较判定，支持 `<<`、`<=`、`=`、`>=`、`>>` 与 `:arch`
+   限定）。
+4. 通过后更新模拟的包版本与文件归属，并释放该包仍占有、但新版不再
+   提供的路径；这些被释放的路径随后可被后续步骤的包取得。
+
+响应始终回带 `publication_id`。全部通过：
+
+```json
+{
+  "publication_id": 7,
+  "result": "no_conflict",
+  "steps": [
+    {"step": 1, "package": "libnew", "version": "2.0",
+     "sha256": "9f2c…", "status": "applied", "files": 12}
+  ]
+}
+```
+
+存在冲突时给出**首个受阻步骤**的包、冲突路径以及当时的属主包名和版本：
+
+```json
+{
+  "publication_id": 7,
+  "result": "conflict",
+  "steps": [{"step": 1, "package": "libnew", "version": "2.0",
+             "sha256": "9f2c…", "status": "blocked"}],
+  "conflict": {
+    "step": 1,
+    "package": "libnew",
+    "version": "2.0",
+    "sha256": "9f2c…",
+    "path": "/usr/lib/libold.so.1",
+    "owner_package": "libold",
+    "owner_version": "1.5-2"
+  }
+}
+```
 
 ## 配置
 
@@ -128,9 +210,12 @@ sh scripts/e2e-apt.sh http://127.0.0.1:8080
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest httpx
 uvicorn app.main:app --reload          # 数据写入 ./data
-pytest -q                              # 22 项测试
+pytest -q                              # 49 项测试
 ```
 
 测试覆盖：发布/回读、旧 Release 按哈希取旧索引与旧包、同名同版本重发、
 两版保留与第三版淘汰、坏包整批拒绝、错误架构拒绝、提交前中断回滚、
-提交后崩溃恢复、下载中被 GC、Release 格式与 by-hash 服务、路径穿越。
+提交后崩溃恢复、下载中被 GC、Release 格式与 by-hash 服务、路径穿越；
+以及解包演练的同包覆盖与路径释放、`Replaces` 属主/版本匹配（与 dpkg
+版本算法对拍）、首个冲突步骤报告、清单/发布/读取三类独立报错、受理后
+发布被淘汰仍能完成、演练对仓库零改动。

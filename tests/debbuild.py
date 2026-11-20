@@ -16,6 +16,9 @@ DEFAULT_CONTROL = {
     "Description": "demo package",
 }
 
+#: Default payload path used when a caller only supplies raw bytes.
+DEFAULT_PAYLOAD_PATH = "usr/share/doc/demo/README"
+
 
 def _tar_gz(members: dict[str, bytes], mtime: int = 0) -> bytes:
     buffer = io.BytesIO()
@@ -26,6 +29,25 @@ def _tar_gz(members: dict[str, bytes], mtime: int = 0) -> bytes:
             info.mode = 0o644
             info.mtime = mtime
             tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def _data_tar(files: dict[str, bytes], symlinks: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.GNU_FORMAT) as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o644
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(data))
+        for name, target in symlinks.items():
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            info.mode = 0o777
+            info.mtime = 0
+            tar.addfile(info)
     return buffer.getvalue()
 
 
@@ -46,9 +68,20 @@ def build_deb(
     path: Path,
     *,
     control: dict[str, str] | None = None,
-    payload: bytes = b"payload\n",
+    payload: bytes | None = b"payload\n",
+    files: dict[str, bytes] | None = None,
+    symlinks: dict[str, str] | None = None,
     arch: str = "amd64",
 ) -> Path:
+    """Build a minimal valid ``.deb`` at *path*.
+
+    *files* maps archive-relative member names to their contents and, when
+    given, takes precedence over the single *payload* blob.  *symlinks* maps
+    member names to their link targets (they must be ignored by the
+    regular-file listing).  Extra control fields such as ``Replaces`` can be
+    passed through *control*.
+    """
+
     fields = dict(DEFAULT_CONTROL)
     fields["Architecture"] = arch
     if control:
@@ -57,9 +90,14 @@ def build_deb(
     control_tar = _tar_gz(
         {"control": control_text.encode(), "md5sums": b""}
     )
-    data_tar = _tar_gz(
-        {"usr/share/doc/demo/README": payload},
-    )
+
+    payload_files: dict[str, bytes] = {}
+    if files is not None:
+        payload_files.update(files)
+    if payload is not None:
+        payload_files.setdefault(DEFAULT_PAYLOAD_PATH, payload)
+    data_tar = _data_tar(payload_files, symlinks or {})
+
     blob = _ar(
         [
             ("debian-binary", b"2.0\n"),

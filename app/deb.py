@@ -225,8 +225,8 @@ def _decompress_stream(stream, name: str, limit: int):
     raise DebError(f"unsupported package data compression: {name}")
 
 
-def _validate_payload(
-    path: Path, offset: int, size: int, member_name: str, limit: int
+def _validate_payload_stream(
+    fh: io.BufferedIOBase, offset: int, size: int, member_name: str, limit: int
 ) -> None:
     """Stream the data archive to prove it is complete and well formed.
 
@@ -235,15 +235,14 @@ def _validate_payload(
     """
 
     try:
-        with path.open("rb") as fh:
-            fh.seek(offset)
-            raw = io.BufferedReader(_SliceReader(fh, size))
-            stream = io.BufferedReader(
-                _decompress_stream(raw, member_name, limit), buffer_size=256 * 1024
-            )
-            with tarfile.open(fileobj=stream, mode="r|") as archive:
-                for _member in archive:
-                    pass
+        fh.seek(offset)
+        raw = io.BufferedReader(_SliceReader(fh, size))
+        stream = io.BufferedReader(
+            _decompress_stream(raw, member_name, limit), buffer_size=256 * 1024
+        )
+        with tarfile.open(fileobj=stream, mode="r|") as archive:
+            for _member in archive:
+                pass
             # Drain the stream so the compression layer verifies its trailer.
             while stream.read(1024 * 1024):
                 pass
@@ -253,6 +252,18 @@ def _validate_payload(
         raise DebError(f"package data archive is corrupt or truncated: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - decoder-specific errors
         raise DebError(f"package data archive is corrupt: {exc}") from exc
+
+
+def _validate_payload(
+    path: Path, offset: int, size: int, member_name: str, limit: int
+) -> None:
+    try:
+        with path.open("rb") as fh:
+            _validate_payload_stream(fh, offset, size, member_name, limit)
+    except DebError:
+        raise
+    except OSError as exc:
+        raise DebError(f"cannot read uploaded package: {exc}") from exc
 
 
 def _decompress(data: bytes, name: str, limit: int) -> bytes:
@@ -431,47 +442,75 @@ def inspect_deb(path: Path, expected_arch: str) -> DebInfo:
         raise DebError("uploaded package is empty")
     try:
         with path.open("rb") as fh:
-            entries = _read_ar_index(fh, size)
-            by_name = {name: (offset, member_size) for name, offset, member_size in entries}
-            if "debian-binary" not in by_name:
-                raise DebError("not a Debian package: debian-binary member is missing")
-            debian_binary = _read_member(
-                fh, *by_name["debian-binary"], 64, "debian-binary"
+            info, _entries, _data_member = inspect_deb_stream(
+                fh, size, expected_arch
             )
-            if not debian_binary.strip().startswith(b"2.0"):
-                raise DebError("unsupported Debian package format version")
-            data_member = next(
-                (name for name in by_name if name.startswith("data.tar")), None
-            )
-            if data_member is None:
-                raise DebError("not a Debian package: data archive is missing")
-            control_member = next(
-                (name for name in by_name if name.startswith("control.tar")), None
-            )
-            if control_member is None:
-                raise DebError("not a Debian package: control archive is missing")
-            raw_control = _read_member(
-                fh, *by_name[control_member], 64 * 1024 * 1024, "control archive"
-            )
-            data_offset, data_size = by_name[data_member]
-    except DebError:
-        raise
+            return info
+    except DebError as exc:
+        if "open package descriptor" not in str(exc):
+            raise
     except OSError as exc:
         raise DebError(f"cannot read uploaded package: {exc}") from exc
+
+    # Only reached for exotic control compression that the pure-Python
+    # decoder cannot handle through the open descriptor.
+    fallback = _inspect_via_dpkg_deb(path, expected_arch)
+    if fallback is None:
+        raise
+    return fallback
+
+
+def inspect_deb_stream(
+    fh: io.BufferedIOBase, size: int, expected_arch: str
+) -> tuple[DebInfo, list[tuple[str, int, int]], str]:
+    """Validate a package reachable through the open descriptor *fh*.
+
+    Unlike :func:`inspect_deb` this never reopens the underlying file, which
+    lets a rehearsal keep reading a pool package even after garbage collection
+    has removed its directory entry.  Returns the metadata, the ar member
+    index (needed to walk the data archive later) and the data member name.
+    """
+
+    if size <= 0:
+        raise DebError("package is empty")
+    entries = _read_ar_index(fh, size)
+    by_name = {name: (offset, member_size) for name, offset, member_size in entries}
+    if "debian-binary" not in by_name:
+        raise DebError("not a Debian package: debian-binary member is missing")
+    debian_binary = _read_member(
+        fh, *by_name["debian-binary"], 64, "debian-binary"
+    )
+    if not debian_binary.strip().startswith(b"2.0"):
+        raise DebError("unsupported Debian package format version")
+    data_member = next(
+        (name for name in by_name if name.startswith("data.tar")), None
+    )
+    if data_member is None:
+        raise DebError("not a Debian package: data archive is missing")
+    control_member = next(
+        (name for name in by_name if name.startswith("control.tar")), None
+    )
+    if control_member is None:
+        raise DebError("not a Debian package: control archive is missing")
+    raw_control = _read_member(
+        fh, *by_name[control_member], 64 * 1024 * 1024, "control archive"
+    )
 
     try:
         info = _inspect_control(raw_control, control_member, expected_arch)
     except DebError as exc:
         if "zstd-compressed" in str(exc):
-            fallback = _inspect_via_dpkg_deb(path, expected_arch)
-            if fallback is None:
-                raise
-            info = fallback
-        else:
-            raise
+            raise DebError(
+                "zstd-compressed control data cannot be inspected through an "
+                "open package descriptor on this server build"
+            ) from exc
+        raise
 
-    _validate_payload(path, data_offset, data_size, data_member, _MAX_PAYLOAD_BYTES)
-    return info
+    data_offset, data_size = by_name[data_member]
+    _validate_payload_stream(
+        fh, data_offset, data_size, data_member, _MAX_PAYLOAD_BYTES
+    )
+    return info, entries, data_member
 
 
 def _inspect_control(raw_control: bytes, control_member: str, expected_arch: str) -> DebInfo:
@@ -482,3 +521,73 @@ def _inspect_control(raw_control: bytes, control_member: str, expected_arch: str
     except UnicodeDecodeError as exc:
         raise DebError("package control file is not valid UTF-8") from exc
     return _validate_fields(parse_control_text(control_str), expected_arch)
+
+
+def archive_member_to_abs_path(name: str) -> str:
+    """Convert a data-archive member name to its installed absolute path.
+
+    Debian data archives store relative names (typically ``./usr/bin/foo``);
+    the installed location is the same path below ``/``.  Names that escape
+    the package root (``..``) or contain NUL bytes are rejected instead of
+    being silently normalised, and non-path members (``.``) are rejected too.
+    """
+
+    if "\x00" in name:
+        raise DebError("data archive member contains a NUL byte")
+    cleaned = name.lstrip("/")
+    parts: list[str] = []
+    for part in cleaned.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise DebError(
+                f"data archive member escapes the package root: {name!r}"
+            )
+        parts.append(part)
+    if not parts:
+        raise DebError(
+            f"data archive member does not map to an installed path: {name!r}"
+        )
+    return "/" + "/".join(parts)
+
+
+def list_regular_files(
+    fh: io.BufferedIOBase,
+    entries: list[tuple[str, int, int]],
+    data_member: str,
+    limit: int = _MAX_PAYLOAD_BYTES,
+) -> list[str]:
+    """Return the sorted absolute paths of the package's regular files.
+
+    Only regular files are considered: directories, symbolic links, hard
+    links and device nodes never own paths in the simulated dpkg database.
+    The package is streamed through *fh* without extracting anything.
+    """
+
+    by_name = {name: (offset, size) for name, offset, size in entries}
+    if data_member not in by_name:
+        raise DebError("not a Debian package: data archive is missing")
+    offset, size = by_name[data_member]
+    fh.seek(offset)
+    raw = io.BufferedReader(_SliceReader(fh, size))
+    stream = io.BufferedReader(
+        _decompress_stream(raw, data_member, limit), buffer_size=256 * 1024
+    )
+    paths: set[str] = set()
+    try:
+        with tarfile.open(fileobj=stream, mode="r|") as archive:
+            for member in archive:
+                # isfile() is true only for regular files: symlinks,
+                # hardlinks, dirs and devices are excluded.
+                if member.isfile():
+                    paths.add(archive_member_to_abs_path(member.name))
+            # Drain the stream so the compression trailer is verified.
+            while stream.read(1024 * 1024):
+                pass
+    except DebError:
+        raise
+    except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
+        raise DebError(f"package data archive is corrupt or truncated: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - decoder-specific errors
+        raise DebError(f"package data archive is corrupt: {exc}") from exc
+    return sorted(paths)
